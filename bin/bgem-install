@@ -1,0 +1,36 @@
+#!/usr/bin/env ruby
+
+# Drop-dead simple bgem installer, to prove the concept.  Don't actually
+# use this binary in anger.
+
+require 'fileutils'
+
+class BGem
+
+  def initialize( path )
+    @path = path
+  end
+
+
+  def unpack( root )
+    FileUtils.mkdir_p( root )
+    system "tar", "-xf", @path.to_s, "-C", root.to_s, "--exclude=DEBIAN/"
+  end
+
+  def depends
+    cmd = ["tar",
+      "-xf",@path.to_s,
+      "--to-stdout",
+      "--wildcards",
+      "DEBIAN/"]
+    IO.popen(cmd,"r"){|io| io.readlines}.map{|l| l.strip}
+  end
+
+
+end # class BGem
+
+
+gem_home = ENV['GEM_HOME'] or fail "Need a $GEM_HOME!"
+bgem_filename = ARGV.shift or fail "Need a .bgem file!"
+
+BGem.new( bgem_filename ).unpack( gem_home )

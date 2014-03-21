@@ -1,0 +1,277 @@
+#!/usr/bin/env ruby
+
+CLI.new( ARGV ).run
+
+BEGIN {
+  require 'fileutils'
+  require 'optparse'
+  require 'pathname'
+  require 'pp'
+  require 'tmpdir'
+
+  class Pathname
+
+    def mkdir_p
+      FileUtils.mkdir_p self
+    end
+
+
+    def write( contents )
+      File.open(self, "wb"){|f| f.write contents}
+    end
+
+
+  end # class Pathname
+
+
+  class Options
+    attr_reader :gem_home, :arch, :output_dir, :depends
+
+    def initialize( argv )
+      parse argv
+      @arch = read_arch
+    end
+
+    private
+    def parse(argv)
+      opt_parser = OptionParser.new do |opts|
+        opts.banner = <<-BANNER
+Usage: #{$0} [options]
+
+Turn an installed gem into a compiled archive called a bgem.
+        BANNER
+
+        opts.on( "-g", "--gem-home GEM_HOME",
+                "Gem home to pack from. "\
+                "Default: ENV['GEM_HOME']." ) do |gem_home|
+          @gem_home = gem_home
+        end
+
+        opts.on( "-o", "--output-dir OUTPUT_DIR",
+                "Directory to write the bgem out to. "\
+                "Default: './bgems'" ) do |output_dir|
+          @output_dir = output_dir
+        end
+
+        opts.on( "--depends",
+                 "Gather platform dependencies (debian only)" ) do 
+          @depends = true
+        end
+
+        opts.on_tail("-h", "--help",
+                     "This messages.") do
+          STDOUT.puts opts
+          STDOUT.puts
+          exit 0
+        end
+      end
+
+      opt_parser.parse argv
+
+      @gem_home   ||= ENV['GEM_HOME']
+      fail "Need a --gem-home!" unless @gem_home
+      @output_dir ||= './bgems'
+    end
+
+
+    def read_arch
+      `dpkg --print-architecture`.strip
+    end
+
+
+  end # class Options
+
+
+  class SharedObject
+    def initialize( filename )
+      @path = Pathname filename
+    end
+
+    def depends
+      `ldd #{@path} | \
+        grep '=> /' | \
+        awk '{print $3}' | \
+        xargs -n1 dpkg -S | \
+        cut -f1 -d: | \
+        sort | 
+        uniq`.
+        split(/\n/).
+        map{|dep| dep.strip}
+    end
+  end # class SharedObject
+
+
+  class InstalledGem
+    attr_reader :gem_dir, :name
+
+    # gem_dir is $GEM_HOME/gems/foo
+    def initialize( gem_dir )
+      @gem_dir = Pathname gem_dir
+      @name = @gem_dir.basename.to_s
+    end
+
+
+    def gem_home
+      @gem_dir.dirname.dirname
+    end
+
+
+    def specification
+      spec_basename = name + ".gemspec"
+      gem_home + "specifications" + spec_basename
+    end
+
+
+    def bins
+      included = Dir[@gem_dir + "bin" + "*"].map{|x| File.basename x}
+      included.map{|bin| gem_home + "bin" + bin}.select{|path| path.file?}
+    end
+
+
+    def contents
+      [gem_dir, specification] + bins
+    end
+
+
+    def valid?
+      specification.exist?
+    end
+
+
+    def ext
+      @gem_dir + "ext"
+    end
+
+
+    def depends
+      if ext.exist?
+        Dir[ext + "**" + "*.so"].
+          map{|soname| SharedObject.new soname}.
+          map{|so| so.depends}.sort.uniq
+      else
+        []
+      end
+    end
+
+  end # class InstalledGem
+
+
+  class GemHome
+    attr_reader :dir
+
+    def initialize( dir )
+      @dir = Pathname( dir )
+    end
+
+    def gems
+      dirs = gem_dirs dir.expand_path
+      dirs.map{|d| InstalledGem.new d}
+    end
+
+    private
+    def gem_dirs( dir )
+      Dir[dir + "gems" + "*"].
+        map{|g| Pathname g}.
+        select{|d| d.directory?}
+    end
+
+
+  end # class GemHome
+
+
+  class BGem
+
+    attr_reader :gem, :arch
+
+    # gem_name is the name-x.y.z - it includes the version.
+    def initialize( gem, arch )
+      @gem  = gem
+      @arch = arch
+    end
+
+
+    def build( out_dir )
+      run_build out_dir, @gem, @arch
+    end
+
+
+    protected
+
+    def run_build( out_dir, gem, arch )
+      FileUtils.mkdir_p( out_dir )
+      relative_contents = gem.contents.
+        map{|pth| pth.relative_path_from gem.gem_home}.
+        map{|pth| pth.to_s}
+
+      system "tar", 
+        "-cf", bgem_filename( out_dir ), 
+        "-C", gem.gem_home.to_s,
+        *relative_contents
+    end
+
+
+    def bgem_filename( out_dir )
+      "#{out_dir}/#{gem.name}-#{arch}.bgem"
+    end
+
+  end # class BGem
+
+
+  class BGemWithDepends < BGem
+
+    protected
+    def run_build( out_dir, gem, arch )
+      super
+      add_depends bgem_filename( out_dir ), gem
+    end
+
+
+    def add_depends( bgem_filename, gem )
+      depends = gem.depends
+      unless depends.empty?
+        Dir.mktmpdir do |tmpdir|
+          deppath = Pathname( tmpdir ) + "DEBIAN" + (gem.name + ".Depends")
+          deppath.dirname.mkdir_p
+          deppath.write depends.join("\n") # one per line, since we need to re-sort and join later anyway
+
+          system "tar", 
+            "-rf", bgem_filename,
+            "-C", tmpdir,
+            "DEBIAN"
+        end
+      end
+    end
+
+
+  end # class BGemWithDepends
+
+
+  class CLI
+
+    def initialize( argv )
+      @options = Options.new( argv )
+    end
+
+    def bgem_class
+      @options.depends ? BGemWithDepends : BGem
+    end
+
+    def run
+      gem_home = GemHome.new( @options.gem_home )
+      gems = gem_home.gems
+      valid, invalid = gems.partition{|gem| gem.valid?}
+
+      valid.map{|gem| bgem_class.new( gem, @options.arch )}.
+        each do |bgem| bgem.build @options.output_dir end
+
+      unless invalid.empty?
+        invalid.each do |gem|
+          STDERR.puts "Unable to export #{gem.name}"
+        end
+        exit 1
+      end
+    end
+
+
+  end # class CLI
+}
