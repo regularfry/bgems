@@ -1,7 +1,7 @@
 bgems
 =====
 
-Proof-of-concept binary gems to simpify ruby deployment.
+Proof-of-concept binary gems to simplify ruby deployment.
 
 A bgem is a packed version of an installed rubygem.  You need to install
 the gem first, normally, before you can create a .bgem.  However you
